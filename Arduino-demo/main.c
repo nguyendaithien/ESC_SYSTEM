@@ -1,131 +1,236 @@
 
-#include <Wire.h>
-//#include <Adafruit_MPU6050.h>
-//#include <Adafruit_VL53L1X.h>
+// code chuan
+#define MAX_LINE_LENGTH (64)
 
-QueueHandle_t xQueue_MPU  ;
-QueueHandle_t xQueue_VL53L1 ;
-#define MAX_QUEUE_SIZE 64
-//Adafruit_MPU6050 mpu;
-//Adafruit_VL53L1X vl53l1;
-
-typedef struct  
-{
+#define GPIO_SECOND 22
+#define GPIO_INTERRUPT 21
+void read_mpu(void *pvParameters);
+void control(void *pvParameters);
+void read_vl53l1(void *pvParameters);
+void Int_INIT( void );
+void pwm_task(void *pvParameters );
+void IRAM_ATTR button_isr_handle( void*);
+SemaphoreHandle_t xSemaphore = NULL ;
+// Define Queue handle
+QueueHandle_t QueueHandle;
+QueueHandle_t QueueHandle_1;
+const int QueueElementSize = 10;
+float index_safety;
+typedef struct{
   float accelerometerX;
-  // float accelerometerY;
-  // float accelerometerZ;
-  // float gyroscopeX;
-  // float gyroscopeY;
-  // float gyroscopeZ;
-}MPU_data;
-typedef struct  
-{
+  float accelerometerY;
+  float accelerometerZ;
+  float gyroscopeX;
+  float gyroscopeY;
+  float gyroscopeZ;
+} mpu_data;
+typedef struct{
   float distance;
-}VL53L1_data;
-int i = 1;
-void task_read_data_MPU( void *pvParamerters )
-{
-    MPU_data mpu_data;
-    
- // mpu.begin();
+} vl53l1_data;
 
-  for(;;) {
-    //sensors_event_t a, g, temp;
-   // mpu.getEvent(&a, &g, &temp);
-     mpu_data.accelerometerX = i*0.01;
-    //  mpu_data.accelerometerY = i*0.02; 
-    //  mpu_data.accelerometerZ =i*0.03;
-    //  mpu_data.gyroscopeX = i*0.04;
-    //  mpu_data.gyroscopeY = i*0.05;
-    //  mpu_data.gyroscopeZ = i*0.06;
-
-    //  mpu_data.accelerometerX = a.acceleration.x;
-    //  mpu_data.accelerometerY = a.acceleration.y; 
-    //  mpu_data.accelerometerZ = a.acceleration.z;
-    //  mpu_data.gyroscopeX = g.gyro.x;
-    //  mpu_data.gyroscopeY = g.gyro.y;
-    //  mpu_data.gyroscopeZ = g.gyro.z;
-    int ret = xQueueSend(xQueue_MPU, (void*) &mpu_data, 0);
-        if(ret == pdTRUE){
-          
-    
-    Serial.printf(" Data of MPU6050 send to FIFO : %f \n",mpu_data.accelerometerX);
-    //, mpu_data.accelerometerY, mpu_data.accelerometerZ );
-    vTaskDelay(500 / portTICK_PERIOD_MS);
-    }
-
-    
-  }
-}
-
-void task_read_data_VL53L1(void *pvParemeters)
-{
- 
-  VL53L1_data vl53l1_data[25] = { 3.5, 4.3, 6.5 ,8.6, 4.3, 6.0, 4.8, 5.6, 2.3, 4.7, 3.5, 4.3, 6.5, 8.6, 4.3, 6.0, 4.8, 5.6, 2.3, 4.7, 3.5, 4.3, 6.5, 8.6, 4.3 };
-  for(;;)
-  {
-    
- int ret = xQueueSend(xQueue_MPU, (void*) &vl53l1_data, 0);
-        if(ret == pdTRUE){
-        
-  Serial.printf("Data of VL53L1 send to FIFO: %f", vl53l1_data[1] );
-        
-  vTaskDelay(200 / portTICK_PERIOD_MS);
-  }
-}
-}
-
-
-void task_control( void *pvParameters )
-{
-  float index_safety;
- 
-      MPU_data mpu_data;
-      VL53L1_data vl53l1;     
-      for(;;)
-      {
-        int ret =xQueueReceive(xQueue_MPU, &mpu_data, 0) ;
-        int ret_1 =xQueueReceive(xQueue_MPU, &vl53l1, 0) ;
-      if(ret == pdPASS && ret_1 == pdPASS ){
-        index_safety = ((vl53l1.distance*vl53l1.distance)/(mpu_data.accelerometerX));
-        // index_safety =  ((vl53l1.distance*vl53l1.distance)/(mpu_data.accelerometerX+mpu_data.accelerometerY-mpu_data.accelerometerZ))
-        // +((vl53l1.distance*vl53l1.distance)/(mpu_data.gyroscopeX+mpu_data.gyroscopeY-mpu_data.gyroscopeZ));
-        if( index_safety > 50.0 )
-        {
-          Serial.println(" ESC is ON !!!!!!!! , Drone will soon ballance \n");
-        }
-        else 
-        {
-          Serial.println(" ESC is OFF !!!!!!!! , Drone being ballance \n");
-        }
-          vTaskDelay(1000 / portTICK_PERIOD_MS);
-      }
-  
-}
-}
-void setup (void)
-{
-  Serial.begin(9600);
+// The setup function runs once when you press reset or power on the board.
+void setup() {
+  // Initialize serial communication at 115200 bits per second:
+  Serial.begin(115200);
   while(!Serial){delay(10);}
-  xQueue_MPU = xQueueCreate(MAX_QUEUE_SIZE, sizeof(MPU_data));
-  //xQueue_VL53L1 = xQueueCreate(MAX_QUEUE_SIZE, sizeof(float));
+  Int_INIT();
+  // Create the queue which will have <QueueElementSize> number of elements, each of size `message_t` and pass the address to <QueueHandle>.
+  QueueHandle = xQueueCreate(QueueElementSize, sizeof(mpu_data));
+  QueueHandle_1 = xQueueCreate( QueueElementSize, sizeof(vl53l1_data) );
+  xSemaphore = xSemaphoreCreateBinary();
 
-  if(xQueue_MPU == NULL){
+  // Check if the queue was successfully created
+  if(QueueHandle == NULL){
     Serial.println("Queue could not be created. Halt.");
     while(1) delay(1000); // Halt at this point as is not possible to continue
   }
-  xTaskCreate( task_read_data_MPU,"task_read_data_MPU", 128, (void *)xQueue_MPU, 5, NULL );
-  xTaskCreate( task_read_data_VL53L1,"task_read_data_VL53L1",128, (void *)xQueue_VL53L1, 4, NULL );
-  xTaskCreate( task_control,"task_control", 128, NULL, 6, NULL );
- // mpu.begin(0x52);
-  //mpu.setAccelerometerRange(MPU6050_RANGE_8_G);
- // mpu.setGyroRange(MPU6050_RANGE_500_DEG);
- // mpu.setFilterBandwidth(MPU6050_BAND_5_HZ);
-  
+
+  // Set up two tasks to run independently.
+  xTaskCreate(
+    read_mpu
+    ,  "read_mpu" // A name just for humans
+    ,  2048        // The stack size can be checked by calling `uxHighWaterMark = uxTaskGetStackHighWaterMark(NULL);`
+    ,  NULL        // No parameter is used
+    ,  2  // Priority, with 3 (configMAX_PRIORITIES - 1) being the highest, and 0 being the lowest.
+    ,  NULL // Task handle is not used here
+    );
+
+  xTaskCreate(
+    control
+    ,  "control"
+    ,  2048  // Stack size
+    ,  NULL  // No parameter is used
+    ,  1  // Priority
+    ,  NULL // Task handle is not used here
+    );
+ xTaskCreate(
+    read_vl53l1
+    ,  "read_vl53l1"
+    ,  2048  // Stack size
+    ,  NULL  // No parameter is used
+    ,  2  // Priority
+    ,  NULL // Task handle is not used here
+    );
+    
+     xTaskCreate(
+        pwm_task
+        , "pwm_task "
+        , 2048
+        , NULL
+        , 1
+        , NULL);
+  // Now the task scheduler, which takes over control of scheduling individual tasks, is automatically started.
+  Serial.printf("\nAnything you write will return as echo.\nMaximum line length is %d characters (+ terminating '0').\nAnything longer will be sent as a separate line.\n\n", MAX_LINE_LENGTH-1);
 }
-void loop()
-{
-  delay(1000);
+
+void loop(){
+  // Loop is free to do any other work
+
+  delay(1000); // While not being used yield the CPU to other tasks
+}
+
+/*--------------------------------------------------*/
+/*---------------------- Tasks ---------------------*/
+/*--------------------------------------------------*/
+
+void control(void *pvParameters){  // This is a task.
+   mpu_data message_1;
+   vl53l1_data message_2;
+   
+  for (;;){ // A Task shall never return or exit.
+    // One approach would be to poll the function (uxQueueMessagesWaiting(QueueHandle) and call delay if nothing is waiting.
+    // The other approach is to use infinite time to wait defined by constant `portMAX_DELAY`:
+    if(QueueHandle != NULL && QueueHandle_1 != NULL){ // Sanity check just to make sure the queue actually exists
+      int ret = xQueueReceive(QueueHandle, (void *)&message_1, portMAX_DELAY);
+      int ret_1 = xQueueReceive(QueueHandle_1, (void *)&message_2, portMAX_DELAY);
+      if(ret == pdPASS && ret_1 == pdPASS){
+      index_safety = (message_2.distance*message_2.distance)/(message_1.accelerometerX+message_1.accelerometerY-message_1.accelerometerZ)
+        +((message_2.distance*message_2.distance)/(message_1.gyroscopeX+message_1.gyroscopeY-message_1.gyroscopeZ)); 
+      
+      Serial.printf(" data of mpu read from queue : %f %f %f %f %f %f\n", message_1.accelerometerX, message_1.accelerometerY,message_1.accelerometerZ,message_1.gyroscopeX, message_1.gyroscopeY,  message_1.gyroscopeZ );
+      Serial.printf(" data of vl53l1 read from queue : %f \n", message_2.distance); 
+      Serial.printf(" Index safety is: %f \n", index_safety);
+      if( index_safety > 30.0 )
+      {
+         Serial.println("ESC TURN ON \n ");
+          digitalWrite(GPIO_SECOND, HIGH);
+      }
+      else 
+      {
+        Serial.println("ESC TURN OFF \n ");
+      }
+      }else if(ret == pdFALSE | ret_1 == pdFALSE){
+        Serial.println("The `TaskWriteToSerial` was unable to receive data from the Queue");
+      }
+      
+    } // Sanity check
+  }
+  vTaskDelay( 1000 /portTICK_PERIOD_MS ); // Infinite loop
+}
+
+      
+
+void read_mpu(void *pvParameters){  // This is a task.
+  mpu_data message;
+  message.accelerometerX = 3.5;
+  message.accelerometerY = 3.5;
+  message.accelerometerZ = 3.5;
+  message.gyroscopeX = 4.0;
+  message.gyroscopeY = 4.0;
+  message.gyroscopeZ = 4.0;
+
+  for (;;){
+      if(QueueHandle != NULL && uxQueueSpacesAvailable(QueueHandle) > 0){
+        int ret = xQueueSendToBack(QueueHandle, (void*) &message, 0);
+        if(ret == pdTRUE){
+          Serial.println("The data mpu send to the Queue");
+          // The message was successfully sent.
+        }else if(ret == errQUEUE_FULL){
+          // Since we are checking uxQueueSpacesAvailable this should not occur, however if more than one task should
+          //   write into the same queue it can fill-up between the test and actual send attempt
+          Serial.println("The `TaskReadFromSerial` was unable to send data into the Queue");
+        } 
+    }else{
+      delay(1000); // Allow other tasks to run when there is nothing to read
+    } 
+  //  message.accelerometerX += 1/2;
+  // message.accelerometerY += 1/2;
+  // message.accelerometerZ += 1/2;
+  // message.gyroscopeX += 1/2;
+  // message.gyroscopeY += 1/2;
+  // message.gyroscopeZ += 1/2;
+  }
+   
 
 }
+void read_vl53l1(void *pvParameters){  // This is a task.
+  vl53l1_data message;
+  message.distance = 8.0;
+  
+
+  for (;;){
+      if(QueueHandle_1 != NULL && uxQueueSpacesAvailable(QueueHandle_1) > 0){
+        int ret = xQueueSendToBack(QueueHandle_1, (void*) &message, 0);
+        if(ret == pdTRUE){
+          Serial.println("The data vl53l1 send to the Queue");
+          // The message was successfully sent.
+        }else if(ret == errQUEUE_FULL){
+          // Since we are checking uxQueueSpacesAvailable this should not occur, however if more than one task should
+          //   write into the same queue it can fill-up between the test and actual send attempt
+          Serial.println("The `TaskReadFromSerial` was unable to send data into the Queue");
+        } 
+    }else{
+      delay(1000); // Allow other tasks to run when there is nothing to read
+    } // Serial buffer check
+  }
+  vTaskDelay( 1000 /portTICK_PERIOD_MS ); // Infinite loop
+}
+void button_isr_handle()
+{
+  xSemaphoreGiveFromISR(xSemaphore, NULL);
+}
+void pwm_task( void *pvParameters)
+ {
+    
+    //bool buttonPressed = false;
+    while(1) {
+      if( xSemaphoreTake( xSemaphore , portMAX_DELAY) == pdTRUE )
+      {
+        if(index_safety < 30 && index_safety >25 ) {
+            
+            Serial.println(" Thurst_1 and Thurst_2 is increating \n");
+            }
+          else if(index_safety < 35 && index_safety  > 30  )
+          {
+           
+            Serial.println(" Thurst_3 and Thurst_4 is increating \n ");
+          }
+          else if( index_safety < 40 && index_safety > 35 )
+          {
+            Serial.println(" Thurst_1 and Thurst_3 is increating \n ");
+          }
+          else if(index_safety < 45 && index_safety > 40)
+          {
+            Serial.println(" Thurst_2 and Thurst_4 is increating \n ");
+          }
+        } 
+           
+       
+        }
+        vTaskDelay(500 / portTICK_PERIOD_MS);
+    } 
+
+
+
+void Int_INIT( void )
+{
+  pinMode( GPIO_SECOND , OUTPUT);
+  digitalWrite( GPIO_SECOND, LOW);
+  pinMode(GPIO_INTERRUPT, INPUT_PULLUP);
+  digitalWrite( GPIO_INTERRUPT, LOW);
+  attachInterrupt(GPIO_INTERRUPT, button_isr_handle , RISING);
+}
+
+
+
 
