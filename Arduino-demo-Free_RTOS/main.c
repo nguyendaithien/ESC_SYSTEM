@@ -1,23 +1,69 @@
 
 // code chuan
+
+
+#include <Arduino.h>
+#include <WiFi.h>
+#include <AsyncTCP.h>
+#include <ESPAsyncWebServer.h>
 #include <Adafruit_MPU6050.h>
 #include <Adafruit_Sensor.h>
+#include <Arduino_JSON.h>
+#include "SPIFFS.h"
+#include "FS.h"
 #include <Wire.h>
-#define MAX_LINE_LENGTH (64)
+
+
+const char* ssid = "13traicaT6";
+const char* password = "13traicat6";
+
+
+// Create AsyncWebServer object on port 80
+AsyncWebServer server(80);
+
+// Create an Event Source on /events
+AsyncEventSource events("/events");
+
+// Json Variable to Hold Sensor Readings
+JSONVar readings;
+
+// Timer variables
+unsigned long lastTime = 0;  
+unsigned long lastTimeTemperature = 0;
+unsigned long lastTimeAcc = 0;
+unsigned long gyroDelay = 10;
+unsigned long temperatureDelay = 1000;
+unsigned long accelerometerDelay = 200;
+
+// Create a sensor object
+Adafruit_MPU6050 mpu;
+
+sensors_event_t a, g, temp;
+static float motorForces[4];
+
+float gyroX, gyroY, gyroZ;
+float accX, accY, accZ;
+float temperature;
+
+//Gyroscope sensor deviation
+float gyroXerror = 0.07;
+float gyroYerror = 0.03;
+float gyroZerror = 0.01;
+ #define MAX_LINE_LENGTH (64)
 #define deltat 100
-#define armLength  0.082f
+#define armLength  0.82f
 // led ////
 #define LED_PIN_1  18 // ESP32 pin GIOP18 connected to LED
 #define LED_PIN_2  5
 #define LED_PIN_3  17
 #define LED_PIN_4  16
 int brightness[4];
-
-
 int fadeAmount = 0;
-//////
 
 
+#define MAX_LINE_LENGTH (64)
+#define deltat 100
+#define armLength  0.082f
 static const char *TAG = "CHECK MEMORY";
 float yaw, pitch, roll;
 #define GPIO_SECOND 19
@@ -29,14 +75,19 @@ void Int_INIT( void );
 void pwm_task(void *pvParameters );
 void leb_blink();
 void IRAM_ATTR button_isr_handle( void*);
+void initSPIFFS();
+String getGyroReadings();
+String getAccReadings();
+String getTemperature();
+void initWiFi();
+void Int_INIT_gpio();
 SemaphoreHandle_t xSemaphore = NULL ;
 // Define Queue handle
 QueueHandle_t QueueHandle;
 QueueHandle_t QueueHandle_1;
 const int QueueElementSize = 10;
-Adafruit_MPU6050 mpu;
-static float motorForces[4];
-//float index_safety;
+
+float index_safety;
 typedef struct{
   float accelerometerX;
   float accelerometerY;
@@ -52,13 +103,52 @@ typedef struct{
 // The setup function runs once when you press reset or power on the board.
 void setup() {
   // Initialize serial communication at 115200 bits per second:
-// led ///
- pinMode(LED_PIN_1, OUTPUT);
-  pinMode(LED_PIN_2, OUTPUT);
-  pinMode(LED_PIN_3, OUTPUT);
-  pinMode(LED_PIN_4, OUTPUT);
-  //////
-  Serial.begin(115200);
+ Serial.begin(115200);
+  initWiFi();
+  initSPIFFS();
+ Int_INIT();
+
+  // Handle Web Server
+  server.on("/", HTTP_GET, [](AsyncWebServerRequest *request){
+    request->send(SPIFFS, "/index.html", "text/html");
+  });
+
+  server.serveStatic("/", SPIFFS, "/");
+
+  server.on("/reset", HTTP_GET, [](AsyncWebServerRequest *request){
+    gyroX=0;
+    gyroY=0;
+    gyroZ=0;
+    request->send(200, "text/plain", "OK");
+  });
+
+  server.on("/resetX", HTTP_GET, [](AsyncWebServerRequest *request){
+    gyroX=0;
+    request->send(200, "text/plain", "OK");
+  });
+
+  server.on("/resetY", HTTP_GET, [](AsyncWebServerRequest *request){
+    gyroY=0;
+    request->send(200, "text/plain", "OK");
+  });
+
+  server.on("/resetZ", HTTP_GET, [](AsyncWebServerRequest *request){
+    gyroZ=0;
+    request->send(200, "text/plain", "OK");
+  });
+
+  // Handle Web Server Events
+  events.onConnect([](AsyncEventSourceClient *client){
+    if(client->lastId()){
+      Serial.printf("Client reconnected! Last message ID that it got is: %u\n", client->lastId());
+    }
+    // send event with message "hello!", id current millis
+    // and set reconnect delay to 1 second
+    client->send("hello!", NULL, millis(), 10000);
+  });
+  server.addHandler(&events);
+
+  server.begin();
   /// MPU
   if (!mpu.begin()) {
     Serial.println("Failed to find MPU6050 chip");
@@ -130,7 +220,7 @@ void setup() {
   delay(100);
   ///////
   while(!Serial){delay(10);}
-  Int_INIT();
+  Int_INIT_gpio();
   // Create the queue which will have <QueueElementSize> number of elements, each of size `message_t` and pass the address to <QueueHandle>.
   QueueHandle = xQueueCreate(QueueElementSize, sizeof(mpu_data));
   QueueHandle_1 = xQueueCreate( QueueElementSize, sizeof(vl53l1_data) );
@@ -176,24 +266,43 @@ void setup() {
         , NULL
         , 1
         , NULL);
+        
+        
+       
         ESP_LOGI(TAG, "[APP] Free memory: %d bytes", esp_get_free_heap_size());
   Serial.printf("\nAnything you write will return as echo.\nMaximum line length is %d characters (+ terminating '0').\nAnything longer will be sent as a separate line.\n\n", MAX_LINE_LENGTH-1);
 }
 
-void loop(){
-  // Loop is free to do any other work
 
-  delay(1000); // While not being used yield the CPU to other tasks
+void loop() {
+ if ((millis() - lastTime) > gyroDelay) {
+    // Send Events to the Web Server with the Sensor Readings
+    events.send(getGyroReadings().c_str(),"gyro_readings",millis());
+    lastTime = millis();
+  }
+  if ((millis() - lastTimeAcc) > accelerometerDelay) {
+    // Send Events to the Web Server with the Sensor Readings
+    events.send(getAccReadings().c_str(),"accelerometer_readings",millis());
+    lastTimeAcc = millis();
+  }
+  if ((millis() - lastTimeTemperature) > temperatureDelay) {
+    // Send Events to the Web Server with the Sensor Readings
+    events.send(getTemperature().c_str(),"temperature_reading",millis());
+    lastTimeTemperature = millis();
+  }
+
+  delay(1200); // While not being used yield the CPU to other tasks
 }
 
 /*--------------------------------------------------*/
 /*---------------------- Tasks ---------------------*/
 /*--------------------------------------------------*/
 
-void control(void *pvParameters){  // This is a task.
+
+  void control(void *pvParameters){  // This is a task.
    mpu_data message_1;
    vl53l1_data message_2;
-   
+   float dlength = 4.8;
   for (;;){ // A Task shall never return or exit.
     // One approach would be to poll the function (uxQueueMessagesWaiting(QueueHandle) and call delay if nothing is waiting.
     // The other approach is to use infinite time to wait defined by constant `portMAX_DELAY`:
@@ -208,7 +317,7 @@ void control(void *pvParameters){  // This is a task.
   float accX = (float)message_1.accelerometerX / 16384.0; // Chia cho 16384 để đưa về gốc tọa độ [-1, 1]
   float accY = (float)message_1.accelerometerY / 16384.0;
   float accZ = (float)message_1.accelerometerZ / 16384.0;
-  pitch = atan2(accY, sqrt(accX * accX + accZ * accZ)) * 180.0 / PI;
+  pitch = atan2(accY, sqrt(accX * accX + accZ * accZ)) * 180.0 / PI ;
   roll = atan2(-accX, accZ) * 180.0 / PI;
 
   float gyroXrad = (float)message_1.gyroscopeX / 131.0 * (PI / 180.0); // Chia cho 131 để đưa về gốc tọa độ (rad/giây)
@@ -229,35 +338,21 @@ void control(void *pvParameters){  // This is a task.
   ///////
       Serial.printf(" data of mpu read from queue : %f %f %f %f %f %f\n", message_1.accelerometerX, message_1.accelerometerY,message_1.accelerometerZ,message_1.gyroscopeX, message_1.gyroscopeY,  message_1.gyroscopeZ );
       Serial.printf(" data of vl53l1 read from queue : %f \n", message_2.distance); 
-      //Serial.printf(" Index safety is: %f \n", index_safety);
-      // if( index_safety > 30.0 )
-      // {
-      //    Serial.println("ESC TURN ON \n ");
-      //    leb_blink();
-          
-      // }
-      // else 
-      // {
-      //   Serial.println("ESC TURN OFF \n ");
-      // }
-      // }else if(ret == pdFALSE | ret_1 == pdFALSE){
-      //   Serial.println("The `TaskWriteToSerial` was unable to receive data from the Queue");
-      // }
        static float thrustToTorque = 0.005964552f;
 
 // thrust = a * pwm^2 + b * pwm
 static float pwmToThrustA = 0.091492681f;
 static float pwmToThrustB = 0.067673604f;
-static float thrust = 0.05f;
+static float thrust = 0.6f;
        const float arm = 0.707106781f * armLength;
   const float rollPart = 0.25f / arm *  0.02;
   const float pitchPart = 0.25f / arm *  0.05;
   const float thrustPart = 0.25f *  thrust; // N (per rotor)
   const float yawPart = 0.25f *  0.05 / thrustToTorque;
-  motorForces[0] = thrustPart - roll - pitch - yaw;
-  motorForces[1] = thrustPart - roll + pitch + yaw;
-  motorForces[2] = thrustPart + roll + pitchPart - yawPart;
-  motorForces[3] = thrustPart + roll - pitch + yaw;
+  motorForces[0] = abs(thrustPart - roll - pitch - yaw) + dlength;
+  motorForces[1] = abs(thrustPart - roll + pitch + yaw);
+  motorForces[2] = abs(thrustPart + roll + pitchPart - yawPart);
+  motorForces[3] = abs(thrustPart + roll - pitch + yaw) + dlength;
  Serial.print("motorForces[0]:");
  Serial.println(motorForces[0]);
  Serial.print("motorForces[1]:");
@@ -272,6 +367,9 @@ static float thrust = 0.05f;
   vTaskDelay( 1000 /portTICK_PERIOD_MS ); // Infinite loop
 }
 }
+
+      
+
 
       
 
@@ -336,19 +434,8 @@ void button_isr_handle()
 
 void pwm_task( void *pvParameters)
  {
-    // motor 
 
-
-
-
-
-
-    //bool buttonPressed = false;
-   for(;;){
-    
-      // if( xSemaphoreTake( xSemaphore , portMAX_DELAY) == pdTRUE )
-      // {
-      
+   for(;;){ 
   analogWrite(LED_PIN_1, brightness[0] +60);
   analogWrite(LED_PIN_2, brightness[1] + 60);
   analogWrite(LED_PIN_3, brightness[2] +60 );
@@ -371,13 +458,11 @@ void pwm_task( void *pvParameters)
      brightness[i]  = -(motorForces[i]);
     }
   }
-
-  // wait for 30 milliseconds to see the dimming effect
   delay(30);
        
         }
-        vTaskDelay(1000 / portTICK_PERIOD_MS);
-    } // Đợi 10ms trước khi đọc lại trạng thái button
+        vTaskDelay(100 / portTICK_PERIOD_MS);
+    }
 
  }
 
@@ -394,7 +479,71 @@ void leb_blink( void )
   digitalWrite( GPIO_SECOND , LOW);
   delay( 400);
 }
+void initWiFi() {
+  WiFi.mode(WIFI_STA);
+  WiFi.begin(ssid, password);
+  Serial.println("");
+  Serial.print("Connecting to WiFi...");
+  while (WiFi.status() != WL_CONNECTED) {
+    Serial.print(" * ");
+    delay(1000);
+  }
+  Serial.println("");
+  Serial.println(WiFi.localIP());
+}
 
+String getGyroReadings(){
+  mpu.getEvent(&a, &g, &temp);
 
+  float gyroX_temp = g.gyro.x;
+  if(abs(gyroX_temp) > gyroXerror)  {
+    gyroX += gyroX_temp/50.00;
+  }
+  
+  float gyroY_temp = g.gyro.y;
+  if(abs(gyroY_temp) > gyroYerror) {
+    gyroY += gyroY_temp/70.00;
+  }
 
+  float gyroZ_temp = g.gyro.z;
+  if(abs(gyroZ_temp) > gyroZerror) {
+    gyroZ += gyroZ_temp/90.00;
+  }
 
+  readings["gyroX"] = String(gyroX);
+  readings["gyroY"] = String(gyroY);
+  readings["gyroZ"] = String(gyroZ);
+
+  String jsonString = JSON.stringify(readings);
+  return jsonString;
+}
+String getAccReadings() {
+  mpu.getEvent(&a, &g, &temp);
+  // Get current acceleration values
+  accX = a.acceleration.x;
+  accY = a.acceleration.y;
+  accZ = a.acceleration.z;
+  readings["accX"] = String(accX);
+  readings["accY"] = String(accY);
+  readings["accZ"] = String(accZ);
+  String accString = JSON.stringify (readings);
+  return accString;
+}
+
+String getTemperature(){
+  mpu.getEvent(&a, &g, &temp);
+  temperature = temp.temperature;
+  return String(temperature);
+}
+
+void initSPIFFS() {
+  if (!SPIFFS.begin()) {
+    Serial.println("An error has occurred while mounting SPIFFS");
+  }
+  Serial.println("SPIFFS mounted successfully");
+}
+void Int_INIT_gpio( void )
+{
+  pinMode(GPIO_INTERRUPT, INPUT_PULLUP);
+  attachInterrupt(GPIO_INTERRUPT, button_isr_handle , RISING);
+}
